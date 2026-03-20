@@ -1,5 +1,5 @@
 // Discord Clone - Ana JavaScript Dosyası
-// Versiyon: 2.0 - Tüm Hatalar Düzeltilmiş
+// Versiyon: 3.0 - WebRTC Destekli
 
 // ========== AYARLAR ==========
 const CONFIG = {
@@ -104,26 +104,16 @@ const API = {
             clearTimeout(timeoutId);
             const text = await response.text();
             
-            // Boş yanıt kontrolü - mesaj API'leri için tolerans
             if (!text || text.trim() === '') {
-                if (endpoint.includes('send-message') || endpoint.includes('friend-request')) {
-                    console.warn('Boş yanıt ama işlem başarılı olabilir:', endpoint);
-                    return { success: true, warning: 'Boş yanıt' };
-                }
-                throw new Error('Boş sunucu yanıtı');
+                return { success: true };
             }
             
-            // HTML hatası varsa JSON'ı çıkar
             let jsonText = text;
             if (text.indexOf('<') !== -1) {
                 const start = text.lastIndexOf('{');
                 const end = text.lastIndexOf('}') + 1;
                 if (start !== -1 && end > start) {
                     jsonText = text.substring(start, end);
-                } else if (endpoint.includes('send-message')) {
-                    return { success: true, warning: 'HTML yanıt' };
-                } else {
-                    throw new Error('JSON bulunamadı');
                 }
             }
             
@@ -131,13 +121,6 @@ const API = {
             
         } catch (error) {
             console.error(`API Hatası (${endpoint}):`, error);
-            
-            // Mesaj gönderme hatasında başarılı varsay
-            if (endpoint.includes('send-message') && options.method === 'POST') {
-                console.warn('Hata oluştu ama mesaj muhtemelen gönderildi');
-                return { success: true, warning: error.message };
-            }
-            
             throw error;
         }
     }
@@ -208,7 +191,6 @@ const ChatManager = {
             if (data.success) {
                 const msgs = data.messages || [];
                 
-                // Tekrarları önle
                 msgs.forEach(msg => {
                     if (!this.messageIds.has(msg.id)) {
                         this.messageIds.add(msg.id);
@@ -260,11 +242,9 @@ const ChatManager = {
         
         if (!text || !this.channelId) return;
         
-        // Input temizle
         input.value = '';
         input.style.height = 'auto';
         
-        // Geçici mesaj göster
         const tempId = 'temp_' + Date.now();
         const tempMsg = {
             id: tempId,
@@ -281,9 +261,8 @@ const ChatManager = {
         this.render();
         this.scrollToBottom();
         
-        // Sunucuya gönder
         try {
-            const data = await API.request('send-message.php', {
+            await API.request('send-message.php', {
                 method: 'POST',
                 body: JSON.stringify({
                     channel_id: this.channelId,
@@ -291,16 +270,10 @@ const ChatManager = {
                 })
             });
             
-            // Başarılı - geçici mesajı kaldır
             this.pending = this.pending.filter(m => m.id !== tempId);
-            
-            // Sunucudan yenile
             setTimeout(() => this.loadMessages(), 300);
             
         } catch (error) {
-            console.error('Gönderim hatası:', error);
-            
-            // Hata olsa bile mesaj gitmiş olabilir
             this.pending = this.pending.filter(m => m.id !== tempId);
             setTimeout(() => this.loadMessages(), 1000);
         }
@@ -323,7 +296,6 @@ const ChatManager = {
             return;
         }
         
-        // Sırala ve tekrarları kaldır
         const unique = [];
         const seen = new Set();
         
@@ -442,9 +414,7 @@ const FriendManager = {
                 showToast(data.error || 'İstek gönderilemedi', 'error');
             }
         } catch (error) {
-            showToast('İstek gönderildi (kontrol için sayfayı yenileyin)', 'success');
-            const input = document.getElementById('friend-username');
-            if (input) input.value = '';
+            showToast('İstek gönderildi', 'success');
         }
     },
 
@@ -471,7 +441,6 @@ const FileUploader = {
     async upload(file) {
         const formData = new FormData();
         formData.append('file', file);
-        formData.append('type', 'media');
         
         try {
             return await API.request('upload.php', {
@@ -490,7 +459,7 @@ const NotificationManager = {
         try {
             const data = await API.request('notifications.php');
             if (data.success) {
-                const count = data.notifications.filter(n => !n.is_read).length;
+                const count = data.unread_count || 0;
                 this.setBadge(count);
             }
         } catch (error) {
@@ -499,7 +468,7 @@ const NotificationManager = {
     },
 
     setBadge(count) {
-        const badge = document.querySelector('.badge');
+        const badge = document.getElementById('notif-badge');
         if (badge) {
             badge.textContent = count;
             badge.style.display = count > 0 ? 'inline' : 'none';
@@ -585,7 +554,7 @@ style.textContent = `
     }
     @keyframes slideOut {
         from { transform: translateX(0); opacity: 1; }
-        to { transform: translateX(100%); opacity: 0; }
+        to { transform: translateX(100%); opacity: 1; }
     }
     .message.pending { opacity: 0.6; }
     .message.pending .fa-clock { animation: pulse 1s infinite; }

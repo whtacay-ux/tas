@@ -1,565 +1,449 @@
 <?php
-// Discord Clone - Kanal ve Mesaj İşlemleri
+// Discord Clone - Kanal İşlemleri
 require_once 'config.php';
 
-// ========== SUNUCU İŞLEMLERİ ==========
-
-function createServer($name, $ownerId, $icon = null) {
+// Sunucu oluştur
+function createServer($name, $ownerId) {
     $db = getDB();
     
     try {
-        $stmt = $db->prepare("INSERT INTO servers (name, owner_id, icon) VALUES (?, ?, ?)");
-        $stmt->execute([$name, $ownerId, $icon]);
+        $db->beginTransaction();
+        
+        // Sunucuyu oluştur
+        $stmt = $db->prepare("INSERT INTO servers (name, owner_id, created_at) VALUES (?, ?, NOW())");
+        $stmt->execute([$name, $ownerId]);
         $serverId = $db->lastInsertId();
         
+        // Sahibi admin olarak ekle
         $stmt = $db->prepare("INSERT INTO server_members (server_id, user_id, role_id) VALUES (?, ?, 1)");
         $stmt->execute([$serverId, $ownerId]);
         
-        createChannel($serverId, 'genel-sohbet', $ownerId, 'text');
-        createChannel($serverId, 'genel-ses', $ownerId, 'voice');
+        // Varsayılan kanalları oluştur
+        $defaultChannels = [
+            ['genel-sohbet', 'text'],
+            ['muzik', 'text'],
+            ['genel-ses', 'voice'],
+            ['görüntülü-görüşme', 'video']
+        ];
         
+        foreach ($defaultChannels as $index => $channel) {
+            $stmt = $db->prepare("INSERT INTO channels (server_id, name, type, position, created_by, created_at) VALUES (?, ?, ?, ?, ?, NOW())");
+            $stmt->execute([$serverId, $channel[0], $channel[1], $index, $ownerId]);
+        }
+        
+        $db->commit();
         return ['success' => true, 'server_id' => $serverId];
-    } catch (PDOException $e) {
+        
+    } catch (Exception $e) {
+        $db->rollBack();
         return ['success' => false, 'error' => $e->getMessage()];
     }
 }
 
-function getUserServers($userId) {
-    $db = getDB();
-    $stmt = $db->prepare("SELECT s.*, sm.role_id FROM servers s JOIN server_members sm ON s.id = sm.server_id WHERE sm.user_id = ? ORDER BY s.created_at DESC");
-    $stmt->execute([$userId]);
-    return $stmt->fetchAll();
-}
-
-function getServerById($serverId) {
-    $db = getDB();
-    $stmt = $db->prepare("SELECT s.*, u.username as owner_name FROM servers s JOIN users u ON s.owner_id = u.id WHERE s.id = ?");
-    $stmt->execute([$serverId]);
-    return $stmt->fetch();
-}
-
-function getServerMembers($serverId) {
-    $db = getDB();
-    $stmt = $db->prepare("SELECT u.id, u.username, u.avatar, u.status, r.role_name, r.color FROM server_members sm JOIN users u ON sm.user_id = u.id JOIN roles r ON sm.role_id = r.id WHERE sm.server_id = ? ORDER BY r.id ASC, u.username ASC");
-    $stmt->execute([$serverId]);
-    return $stmt->fetchAll();
-}
-
-// ========== KANAL İŞLEMLERİ ==========
-
-function createChannel($serverId, $name, $createdBy, $type = 'text', $isPrivate = false) {
+// Kanal oluştur
+function createChannel($serverId, $name, $type, $createdBy) {
     $db = getDB();
     
-    // Sunucu var mı kontrol et
-    $stmt = $db->prepare("SELECT id FROM servers WHERE id = ?");
-    $stmt->execute([$serverId]);
-    if (!$stmt->fetch()) {
-        return ['success' => false, 'error' => 'Sunucu bulunamadı'];
+    // Yetki kontrolü
+    if (!isServerOwner($serverId) && !isModerator()) {
+        return ['success' => false, 'error' => 'Yetkiniz yok'];
     }
-    
-    // Kullanıcı var mı kontrol et
-    $stmt = $db->prepare("SELECT id FROM users WHERE id = ?");
-    $stmt->execute([$createdBy]);
-    if (!$stmt->fetch()) {
-        return ['success' => false, 'error' => 'Kullanıcı bulunamadı'];
-    }
-    
-    $stmt = $db->prepare("SELECT MAX(position) as max_pos FROM channels WHERE server_id = ?");
-    $stmt->execute([$serverId]);
-    $result = $stmt->fetch();
-    $position = ($result['max_pos'] ?? 0) + 1;
     
     try {
-        $stmt = $db->prepare("INSERT INTO channels (server_id, name, type, position, is_private, created_by) VALUES (?, ?, ?, ?, ?, ?)");
-        $stmt->execute([$serverId, $name, $type, $position, $isPrivate ? 1 : 0, $createdBy]);
+        // Son pozisyonu bul
+        $stmt = $db->prepare("SELECT MAX(position) as max_pos FROM channels WHERE server_id = ? AND type = ?");
+        $stmt->execute([$serverId, $type]);
+        $result = $stmt->fetch();
+        $position = ($result['max_pos'] ?? -1) + 1;
+        
+        // Kanalı oluştur
+        $stmt = $db->prepare("INSERT INTO channels (server_id, name, type, position, created_by, created_at) VALUES (?, ?, ?, ?, ?, NOW())");
+        $stmt->execute([$serverId, $name, $type, $position, $createdBy]);
         $channelId = $db->lastInsertId();
         
-        // Varsayılan davet kodu oluştur
-        createChannelInvite($channelId, $createdBy);
-        
         return ['success' => true, 'channel_id' => $channelId];
-    } catch (PDOException $e) {
+        
+    } catch (Exception $e) {
         return ['success' => false, 'error' => $e->getMessage()];
     }
 }
 
-function getServerChannels($serverId) {
-    $db = getDB();
-    $stmt = $db->prepare("SELECT c.*, u.username as creator_name FROM channels c JOIN users u ON c.created_by = u.id WHERE c.server_id = ? ORDER BY c.position ASC");
-    $stmt->execute([$serverId]);
-    return $stmt->fetchAll();
-}
-
-function getChannelById($channelId) {
-    $db = getDB();
-    $stmt = $db->prepare("SELECT c.*, s.name as server_name, u.username as creator_name FROM channels c JOIN servers s ON c.server_id = s.id JOIN users u ON c.created_by = u.id WHERE c.id = ?");
-    $stmt->execute([$channelId]);
-    return $stmt->fetch();
-}
-
-// ========== DAVET SİSTEMİ ==========
-
-function createChannelInvite($channelId, $userId, $maxUses = 0, $expiresHours = null) {
+// Kanal sil
+function deleteChannel($channelId) {
     $db = getDB();
     
-    $code = substr(str_shuffle('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'), 0, 8);
+    $channel = getChannelById($channelId);
+    if (!$channel) {
+        return ['success' => false, 'error' => 'Kanal bulunamadı'];
+    }
     
-    $expiresAt = null;
-    if ($expiresHours) {
-        $expiresAt = date('Y-m-d H:i:s', strtotime("+{$expiresHours} hours"));
+    // Yetki kontrolü
+    if (!isServerOwner($channel['server_id']) && !isAdmin()) {
+        return ['success' => false, 'error' => 'Yetkiniz yok'];
     }
     
     try {
-        $stmt = $db->prepare("INSERT INTO channel_invites (channel_id, invite_code, created_by, max_uses, expires_at) VALUES (?, ?, ?, ?, ?)");
-        $stmt->execute([$channelId, $code, $userId, $maxUses, $expiresAt]);
-        
-        return ['success' => true, 'code' => $code, 'invite_id' => $db->lastInsertId()];
-    } catch (PDOException $e) {
-        if ($e->getCode() == 23000) {
-            return createChannelInvite($channelId, $userId, $maxUses, $expiresHours);
-        }
+        $stmt = $db->prepare("DELETE FROM channels WHERE id = ?");
+        $stmt->execute([$channelId]);
+        return ['success' => true];
+    } catch (Exception $e) {
         return ['success' => false, 'error' => $e->getMessage()];
     }
 }
 
-function validateInviteCode($code) {
+// Sunucu davet linki oluştur
+function createServerInvite($serverId, $createdBy, $maxUses = 0, $expiresAt = null) {
     $db = getDB();
     
-    $stmt = $db->prepare("SELECT i.*, c.name as channel_name, c.server_id, s.name as server_name 
-                          FROM channel_invites i 
-                          JOIN channels c ON i.channel_id = c.id 
-                          JOIN servers s ON c.server_id = s.id 
-                          WHERE i.invite_code = ? AND i.is_active = TRUE");
-    $stmt->execute([$code]);
+    // Yetki kontrolü
+    if (!isServerOwner($serverId) && !hasChannelPermission(null, 'manage_server')) {
+        return ['success' => false, 'error' => 'Yetkiniz yok'];
+    }
+    
+    try {
+        $inviteCode = generateInviteCode();
+        
+        $stmt = $db->prepare("INSERT INTO server_invites (server_id, invite_code, created_by, max_uses, expires_at, created_at) VALUES (?, ?, ?, ?, ?, NOW())");
+        $stmt->execute([$serverId, $inviteCode, $createdBy, $maxUses, $expiresAt]);
+        
+        return ['success' => true, 'invite_code' => $inviteCode];
+        
+    } catch (Exception $e) {
+        return ['success' => false, 'error' => $e->getMessage()];
+    }
+}
+
+// Sunucu davet linkini doğrula
+function validateServerInvite($inviteCode) {
+    $db = getDB();
+    
+    $stmt = $db->prepare("SELECT * FROM server_invites WHERE invite_code = ? AND is_active = 1");
+    $stmt->execute([$inviteCode]);
     $invite = $stmt->fetch();
     
     if (!$invite) {
-        return ['valid' => false, 'error' => 'Geçersiz davet kodu'];
+        return ['success' => false, 'error' => 'Geçersiz davet linki'];
     }
     
+    // Süre kontrolü
     if ($invite['expires_at'] && strtotime($invite['expires_at']) < time()) {
-        return ['valid' => false, 'error' => 'Davet kodunun süresi doldu'];
+        return ['success' => false, 'error' => 'Davet linkinin süresi dolmuş'];
     }
     
+    // Kullanım limiti kontrolü
     if ($invite['max_uses'] > 0 && $invite['used_count'] >= $invite['max_uses']) {
-        return ['valid' => false, 'error' => 'Davet kodu kullanım limitine ulaştı'];
+        return ['success' => false, 'error' => 'Davet linki kullanım limitine ulaşmış'];
     }
     
-    return ['valid' => true, 'invite' => $invite];
+    return ['success' => true, 'invite' => $invite];
 }
 
-function useInviteCode($code, $userId) {
+// Davet linki ile sunucuya katıl
+function joinServerWithInvite($inviteCode, $userId) {
     $db = getDB();
     
-    $validation = validateInviteCode($code);
-    if (!$validation['valid']) {
+    $validation = validateServerInvite($inviteCode);
+    if (!$validation['success']) {
         return $validation;
     }
     
     $invite = $validation['invite'];
     
+    // Zaten üye mi kontrol et
+    $stmt = $db->prepare("SELECT id FROM server_members WHERE server_id = ? AND user_id = ?");
+    $stmt->execute([$invite['server_id'], $userId]);
+    if ($stmt->fetch()) {
+        return ['success' => false, 'error' => 'Zaten bu sunucunun üyesisiniz'];
+    }
+    
     try {
-        $stmt = $db->prepare("UPDATE channel_invites SET used_count = used_count + 1 WHERE id = ?");
-        $stmt->execute([$invite['id']]);
+        $db->beginTransaction();
         
-        $stmt = $db->prepare("INSERT INTO channel_invite_uses (invite_id, user_id) VALUES (?, ?)");
-        $stmt->execute([$invite['id'], $userId]);
-        
-        $stmt = $db->prepare("SELECT 1 FROM server_members WHERE server_id = ? AND user_id = ?");
+        // Üye olarak ekle (Member rolü = 3)
+        $stmt = $db->prepare("INSERT INTO server_members (server_id, user_id, role_id) VALUES (?, ?, 3)");
         $stmt->execute([$invite['server_id'], $userId]);
         
-        if (!$stmt->fetch()) {
-            $stmt = $db->prepare("INSERT INTO server_members (server_id, user_id, role_id) VALUES (?, ?, 3)");
-            $stmt->execute([$invite['server_id'], $userId]);
-        }
+        // Kullanım sayısını artır
+        $stmt = $db->prepare("UPDATE server_invites SET used_count = used_count + 1 WHERE id = ?");
+        $stmt->execute([$invite['id']]);
         
-        return ['success' => true, 'channel_id' => $invite['channel_id'], 'server_id' => $invite['server_id']];
+        // Kullanım kaydı ekle
+        $stmt = $db->prepare("INSERT INTO server_invite_uses (invite_id, user_id) VALUES (?, ?)");
+        $stmt->execute([$invite['id'], $userId]);
         
-    } catch (PDOException $e) {
+        $db->commit();
+        
+        return ['success' => true, 'server_id' => $invite['server_id']];
+        
+    } catch (Exception $e) {
+        $db->rollBack();
         return ['success' => false, 'error' => $e->getMessage()];
     }
 }
 
-function getChannelInvites($channelId, $userId) {
+// Sunucu davet linklerini getir
+function getServerInvites($serverId) {
     $db = getDB();
     
-    $channel = getChannelById($channelId);
-    if (!$channel) return [];
-    
-    $server = getServerById($channel['server_id']);
-    $isAdmin = ($server['owner_id'] == $userId || isModerator());
-    
-    if (!$isAdmin) {
-        $stmt = $db->prepare("SELECT * FROM channel_invites WHERE channel_id = ? AND created_by = ? AND is_active = TRUE ORDER BY created_at DESC");
-        $stmt->execute([$channelId, $userId]);
-    } else {
-        $stmt = $db->prepare("SELECT i.*, u.username as creator_name FROM channel_invites i JOIN users u ON i.created_by = u.id WHERE i.channel_id = ? AND i.is_active = TRUE ORDER BY i.created_at DESC");
-        $stmt->execute([$channelId]);
-    }
-    
+    $stmt = $db->prepare("SELECT i.*, u.username as created_by_name,
+                          (SELECT COUNT(*) FROM server_invite_uses WHERE invite_id = i.id) as actual_uses
+                          FROM server_invites i 
+                          JOIN users u ON i.created_by = u.id 
+                          WHERE i.server_id = ? AND i.is_active = 1 
+                          ORDER BY i.created_at DESC");
+    $stmt->execute([$serverId]);
     return $stmt->fetchAll();
 }
 
-function deleteInviteCode($inviteId, $userId) {
+// Sunucu davet linkini sil
+function deleteServerInvite($inviteId) {
     $db = getDB();
     
-    $stmt = $db->prepare("SELECT i.*, c.server_id FROM channel_invites i JOIN channels c ON i.channel_id = c.id WHERE i.id = ?");
+    $stmt = $db->prepare("SELECT server_id FROM server_invites WHERE id = ?");
     $stmt->execute([$inviteId]);
-    $invite = $stmt->fetch();
-    
-    if (!$invite) return ['success' => false, 'error' => 'Davet bulunamadı'];
-    
-    $server = getServerById($invite['server_id']);
-    $isAdmin = ($server['owner_id'] == $userId || isModerator());
-    
-    if (!$isAdmin && $invite['created_by'] != $userId) {
-        return ['success' => false, 'error' => 'Yetkiniz yok'];
-    }
-    
-    $stmt = $db->prepare("UPDATE channel_invites SET is_active = FALSE WHERE id = ?");
-    $stmt->execute([$inviteId]);
-    
-    return ['success' => true];
-}
-
-// ========== KANAL ARKADAŞLARI ==========
-
-function inviteFriendToChannel($channelId, $friendId, $invitedBy) {
-    $db = getDB();
-    
-    $stmt = $db->prepare("SELECT 1 FROM friendships WHERE 
-        ((requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?)) 
-        AND status = 'accepted'");
-    $stmt->execute([$invitedBy, $friendId, $friendId, $invitedBy]);
-    
-    if (!$stmt->fetch()) {
-        return ['success' => false, 'error' => 'Bu kullanıcı arkadaşınız değil'];
-    }
-    
-    $channel = getChannelById($channelId);
-    $stmt = $db->prepare("SELECT 1 FROM server_members WHERE server_id = ? AND user_id = ?");
-    $stmt->execute([$channel['server_id'], $friendId]);
-    
-    if ($stmt->fetch()) {
-        return ['success' => false, 'error' => 'Kullanıcı zaten sunucuda'];
-    }
-    
-    $stmt = $db->prepare("SELECT status FROM channel_friends WHERE channel_id = ? AND user_id = ?");
-    $stmt->execute([$channelId, $friendId]);
-    $existing = $stmt->fetch();
-    
-    if ($existing) {
-        if ($existing['status'] == 'pending') {
-            return ['success' => false, 'error' => 'Zaten davet edilmiş'];
-        }
-        $stmt = $db->prepare("UPDATE channel_friends SET status = 'pending', invited_by = ?, invited_at = NOW() WHERE channel_id = ? AND user_id = ?");
-        $stmt->execute([$invitedBy, $channelId, $friendId]);
-    } else {
-        $stmt = $db->prepare("INSERT INTO channel_friends (channel_id, user_id, invited_by) VALUES (?, ?, ?)");
-        $stmt->execute([$channelId, $friendId, $invitedBy]);
-    }
-    
-    $stmt = $db->prepare("SELECT username FROM users WHERE id = ?");
-    $stmt->execute([$invitedBy]);
-    $inviter = $stmt->fetch();
-    
-    $stmt = $db->prepare("INSERT INTO notifications (user_id, sender_id, notification_type, content, related_id) VALUES (?, ?, 'channel_join', ?, ?)");
-    $stmt->execute([$friendId, $invitedBy, "{$inviter['username']} sizi bir kanala davet etti", $channelId]);
-    
-    return ['success' => true];
-}
-
-function getPendingChannelInvites($userId) {
-    $db = getDB();
-    
-    $stmt = $db->prepare("SELECT cf.*, c.name as channel_name, s.name as server_name, s.id as server_id, u.username as inviter_name 
-                          FROM channel_friends cf 
-                          JOIN channels c ON cf.channel_id = c.id 
-                          JOIN servers s ON c.server_id = s.id 
-                          JOIN users u ON cf.invited_by = u.id 
-                          WHERE cf.user_id = ? AND cf.status = 'pending'");
-    $stmt->execute([$userId]);
-    
-    return $stmt->fetchAll();
-}
-
-function respondChannelInvite($channelFriendId, $userId, $accept) {
-    $db = getDB();
-    
-    $stmt = $db->prepare("SELECT cf.*, c.server_id FROM channel_friends cf JOIN channels c ON cf.channel_id = c.id WHERE cf.id = ? AND cf.user_id = ?");
-    $stmt->execute([$channelFriendId, $userId]);
     $invite = $stmt->fetch();
     
     if (!$invite) {
-        return ['success' => false, 'error' => 'Davet bulunamadı'];
+        return ['success' => false, 'error' => 'Davet linki bulunamadı'];
     }
     
-    if ($accept) {
-        $stmt = $db->prepare("INSERT IGNORE INTO server_members (server_id, user_id, role_id) VALUES (?, ?, 3)");
-        $stmt->execute([$invite['server_id'], $userId]);
-        
-        $stmt = $db->prepare("UPDATE channel_friends SET status = 'accepted' WHERE id = ?");
-        $stmt->execute([$channelFriendId]);
-        
-        return ['success' => true, 'action' => 'accepted', 'server_id' => $invite['server_id'], 'channel_id' => $invite['channel_id']];
-    } else {
-        $stmt = $db->prepare("UPDATE channel_friends SET status = 'left' WHERE id = ?");
-        $stmt->execute([$channelFriendId]);
-        
-        return ['success' => true, 'action' => 'rejected'];
+    // Yetki kontrolü
+    if (!isServerOwner($invite['server_id']) && !isAdmin()) {
+        return ['success' => false, 'error' => 'Yetkiniz yok'];
     }
-}
-
-// ========== MESAJ İŞLEMLERİ ==========
-
-function sendMessage($userId, $channelId, $message, $mediaUrl = null, $mediaType = null, $replyTo = null) {
-    if (empty(trim($message)) && !$mediaUrl) {
-        return ['success' => false, 'error' => 'Mesaj boş olamaz'];
-    }
-    
-    $db = getDB();
     
     try {
-        $stmt = $db->prepare("INSERT INTO messages (user_id, channel_id, message, media_url, media_type, reply_to) VALUES (?, ?, ?, ?, ?, ?)");
-        $stmt->execute([$userId, $channelId, $message, $mediaUrl, $mediaType, $replyTo]);
-        $messageId = $db->lastInsertId();
-        
-        sendChannelNotifications($userId, $channelId, $message);
-        
-        return ['success' => true, 'message_id' => $messageId];
-    } catch (PDOException $e) {
+        $stmt = $db->prepare("UPDATE server_invites SET is_active = 0 WHERE id = ?");
+        $stmt->execute([$inviteId]);
+        return ['success' => true];
+    } catch (Exception $e) {
         return ['success' => false, 'error' => $e->getMessage()];
     }
 }
 
-function getChannelMessages($channelId, $limit = 50, $beforeId = null) {
+// Kullanıcı rolünü güncelle (sunucu sahibi veya admin)
+function updateUserRole($serverId, $userId, $newRoleId, $updatedBy) {
     $db = getDB();
     
-    $sql = "SELECT m.*, u.username, u.avatar, u.status, r.color as user_color,
-            (SELECT COUNT(*) FROM message_reactions WHERE message_id = m.id) as reaction_count
-            FROM messages m 
-            JOIN users u ON m.user_id = u.id 
-            JOIN roles r ON u.role_id = r.id 
-            WHERE m.channel_id = ?";
-    
-    $params = [$channelId];
-    
-    if ($beforeId) {
-        $sql .= " AND m.id < ?";
-        $params[] = $beforeId;
+    // Yetki kontrolü - sadece sunucu sahibi veya admin rol atayabilir
+    $updater = getCurrentUser();
+    if (!$updater) {
+        return ['success' => false, 'error' => 'Giriş gerekli'];
     }
     
-    $sql .= " ORDER BY m.created_at DESC LIMIT ?";
-    $params[] = $limit;
+    $isOwner = isServerOwner($serverId);
+    $isAdminUser = ($updater['role_name'] === 'Admin');
     
-    $stmt = $db->prepare($sql);
-    $stmt->execute($params);
-    $messages = $stmt->fetchAll();
-    
-    foreach ($messages as &$message) {
-        $message['reactions'] = getMessageReactions($message['id']);
+    if (!$isOwner && !$isAdminUser) {
+        return ['success' => false, 'error' => 'Rol atama yetkiniz yok'];
     }
     
-    return array_reverse($messages);
-}
-
-function deleteMessage($messageId, $userId) {
-    $db = getDB();
-    
-    $stmt = $db->prepare("SELECT user_id FROM messages WHERE id = ?");
-    $stmt->execute([$messageId]);
-    $message = $stmt->fetch();
-    
-    if (!$message) {
-        return ['success' => false, 'error' => 'Mesaj bulunamadı'];
+    // Kendini düşürme kontrolü
+    if ($userId == $updater['id'] && $isOwner) {
+        return ['success' => false, 'error' => 'Kendi rolünüzü düşüremezsiniz'];
     }
     
-    if ($message['user_id'] != $userId && !isModerator()) {
-        return ['success' => false, 'error' => 'Yetkiniz yok'];
+    // Hedef kullanıcının mevcut rolünü kontrol et
+    $stmt = $db->prepare("SELECT sm.*, r.role_name FROM server_members sm 
+                          JOIN roles r ON sm.role_id = r.id 
+                          WHERE sm.server_id = ? AND sm.user_id = ?");
+    $stmt->execute([$serverId, $userId]);
+    $targetMember = $stmt->fetch();
+    
+    if (!$targetMember) {
+        return ['success' => false, 'error' => 'Kullanıcı sunucuda bulunamadı'];
     }
     
-    $stmt = $db->prepare("DELETE FROM messages WHERE id = ?");
-    $stmt->execute([$messageId]);
-    
-    return ['success' => true];
-}
-
-function editMessage($messageId, $userId, $newMessage) {
-    $db = getDB();
-    
-    $stmt = $db->prepare("SELECT user_id FROM messages WHERE id = ?");
-    $stmt->execute([$messageId]);
-    $message = $stmt->fetch();
-    
-    if (!$message || $message['user_id'] != $userId) {
-        return ['success' => false, 'error' => 'Yetkiniz yok'];
+    // Başka bir adminin rolünü değiştirme kontrolü
+    if ($targetMember['role_name'] === 'Admin' && !$isOwner) {
+        return ['success' => false, 'error' => 'Başka bir adminin rolünü değiştiremezsiniz'];
     }
     
-    $stmt = $db->prepare("UPDATE messages SET message = ?, is_edited = TRUE, updated_at = NOW() WHERE id = ?");
-    $stmt->execute([$newMessage, $messageId]);
-    
-    return ['success' => true];
-}
-
-// ========== TEPKİ İŞLEMLERİ ==========
-
-function toggleReaction($messageId, $userId, $emoji) {
-    $db = getDB();
-    
-    $stmt = $db->prepare("SELECT id FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?");
-    $stmt->execute([$messageId, $userId, $emoji]);
-    
-    if ($stmt->fetch()) {
-        $stmt = $db->prepare("DELETE FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?");
-        $stmt->execute([$messageId, $userId, $emoji]);
-        return ['success' => true, 'action' => 'removed'];
-    } else {
-        $stmt = $db->prepare("INSERT INTO message_reactions (message_id, user_id, emoji) VALUES (?, ?, ?)");
-        $stmt->execute([$messageId, $userId, $emoji]);
-        return ['success' => true, 'action' => 'added'];
-    }
-}
-
-function getMessageReactions($messageId) {
-    $db = getDB();
-    $stmt = $db->prepare("SELECT emoji, COUNT(*) as count FROM message_reactions WHERE message_id = ? GROUP BY emoji");
-    $stmt->execute([$messageId]);
-    return $stmt->fetchAll();
-}
-
-// ========== BİLDİRİM İŞLEMLERİ ==========
-
-function sendNotification($userId, $senderId, $type, $content, $relatedId = null) {
-    $db = getDB();
-    
-    $stmt = $db->prepare("INSERT INTO notifications (user_id, sender_id, notification_type, content, related_id) VALUES (?, ?, ?, ?, ?)");
-    return $stmt->execute([$userId, $senderId, $type, $content, $relatedId]);
-}
-
-function sendChannelNotifications($senderId, $channelId, $message) {
-    $db = getDB();
-    
-    $channel = getChannelById($channelId);
-    if (!$channel) return;
-    
-    $stmt = $db->prepare("SELECT user_id FROM server_members WHERE server_id = ? AND user_id != ?");
-    $stmt->execute([$channel['server_id'], $senderId]);
-    $members = $stmt->fetchAll();
-    
-    $sender = getUserById($senderId);
-    $content = substr($message, 0, 100) . (strlen($message) > 100 ? '...' : '');
-    
-    foreach ($members as $member) {
-        sendNotification($member['user_id'], $senderId, 'message', "{$sender['username']}: $content", $channelId);
-    }
-}
-
-function getUserNotifications($userId, $unreadOnly = false) {
-    $db = getDB();
-    
-    $sql = "SELECT n.*, u.username as sender_name, u.avatar as sender_avatar 
-            FROM notifications n 
-            LEFT JOIN users u ON n.sender_id = u.id 
-            WHERE n.user_id = ?";
-    
-    if ($unreadOnly) {
-        $sql .= " AND n.is_read = FALSE";
+    // Yeni rolü kontrol et
+    $newRole = getRoleById($newRoleId);
+    if (!$newRole) {
+        return ['success' => false, 'error' => 'Geçersiz rol'];
     }
     
-    $sql .= " ORDER BY n.created_at DESC LIMIT 50";
-    
-    $stmt = $db->prepare($sql);
-    $stmt->execute([$userId]);
-    return $stmt->fetchAll();
-}
-
-function markNotificationRead($notificationId, $userId) {
-    $db = getDB();
-    $stmt = $db->prepare("UPDATE notifications SET is_read = TRUE WHERE id = ? AND user_id = ?");
-    return $stmt->execute([$notificationId, $userId]);
-}
-
-function markAllNotificationsRead($userId) {
-    $db = getDB();
-    $stmt = $db->prepare("UPDATE notifications SET is_read = TRUE WHERE user_id = ? AND is_read = FALSE");
-    return $stmt->execute([$userId]);
-}
-
-// ========== ARKADAŞLIK İŞLEMLERİ ==========
-
-function sendFriendRequest($requesterId, $addresseeId) {
-    if ($requesterId == $addresseeId) {
-        return ['success' => false, 'error' => 'Kendinize istek gönderemezsiniz'];
-    }
-    
-    $db = getDB();
-    
-    $stmt = $db->prepare("SELECT status FROM friendships WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?)");
-    $stmt->execute([$requesterId, $addresseeId, $addresseeId, $requesterId]);
-    $existing = $stmt->fetch();
-    
-    if ($existing) {
-        return ['success' => false, 'error' => 'Zaten bir istek mevcut veya arkadaşsınız'];
+    // Admin atama yetkisi kontrolü (sadece sahibi admin atayabilir)
+    if ($newRole['role_name'] === 'Admin' && !$isOwner) {
+        return ['success' => false, 'error' => 'Sadece sunucu sahibi admin atayabilir'];
     }
     
     try {
-        $stmt = $db->prepare("INSERT INTO friendships (requester_id, addressee_id) VALUES (?, ?)");
-        $stmt->execute([$requesterId, $addresseeId]);
+        $stmt = $db->prepare("UPDATE server_members SET role_id = ? WHERE server_id = ? AND user_id = ?");
+        $stmt->execute([$newRoleId, $serverId, $userId]);
         
-        $requester = getUserById($requesterId);
-        sendNotification($addresseeId, $requesterId, 'friend_request', "{$requester['username']} size arkadaşlık isteği gönderdi");
+        // Kullanıcı tablosundaki rolü de güncelle (aktif sunucu rolü)
+        $stmt = $db->prepare("UPDATE users SET role_id = ? WHERE id = ?");
+        $stmt->execute([$newRoleId, $userId]);
+        
+        return ['success' => true, 'message' => "Kullanıcının rolü '{$newRole['role_name']}' olarak güncellendi"];
+        
+    } catch (Exception $e) {
+        return ['success' => false, 'error' => $e->getMessage()];
+    }
+}
+
+// Sunucudan kullanıcı at
+function kickUserFromServer($serverId, $userId, $kickedBy) {
+    $db = getDB();
+    
+    // Yetki kontrolü
+    if (!isServerOwner($serverId) && !hasChannelPermission(null, 'kick_user')) {
+        return ['success' => false, 'error' => 'Yetkiniz yok'];
+    }
+    
+    // Kendini atma kontrolü
+    if ($userId == $kickedBy) {
+        return ['success' => false, 'error' => 'Kendinizi atamazsınız'];
+    }
+    
+    // Hedef kullanıcı admin mi?
+    $stmt = $db->prepare("SELECT r.role_name FROM server_members sm 
+                          JOIN roles r ON sm.role_id = r.id 
+                          WHERE sm.server_id = ? AND sm.user_id = ?");
+    $stmt->execute([$serverId, $userId]);
+    $target = $stmt->fetch();
+    
+    if ($target && $target['role_name'] === 'Admin' && !isServerOwner($serverId)) {
+        return ['success' => false, 'error' => 'Admin kullanıcıyı atamazsınız'];
+    }
+    
+    try {
+        $stmt = $db->prepare("DELETE FROM server_members WHERE server_id = ? AND user_id = ?");
+        $stmt->execute([$serverId, $userId]);
         
         return ['success' => true];
-    } catch (PDOException $e) {
+    } catch (Exception $e) {
         return ['success' => false, 'error' => $e->getMessage()];
     }
 }
 
-function respondFriendRequest($friendshipId, $userId, $accept) {
+// Sunucudan kullanıcı yasakla
+function banUserFromServer($serverId, $userId, $bannedBy, $reason = '') {
     $db = getDB();
     
-    $stmt = $db->prepare("SELECT * FROM friendships WHERE id = ? AND addressee_id = ? AND status = 'pending'");
-    $stmt->execute([$friendshipId, $userId]);
-    $friendship = $stmt->fetch();
-    
-    if (!$friendship) {
-        return ['success' => false, 'error' => 'İstek bulunamadı'];
+    // Yetki kontrolü
+    if (!isServerOwner($serverId) && !hasChannelPermission(null, 'ban_user')) {
+        return ['success' => false, 'error' => 'Yetkiniz yok'];
     }
     
-    if ($accept) {
-        $stmt = $db->prepare("UPDATE friendships SET status = 'accepted' WHERE id = ?");
-        $stmt->execute([$friendshipId]);
-        return ['success' => true, 'action' => 'accepted'];
-    } else {
-        $stmt = $db->prepare("DELETE FROM friendships WHERE id = ?");
-        $stmt->execute([$friendshipId]);
-        return ['success' => true, 'action' => 'rejected'];
+    // Kendini yasaklama kontrolü
+    if ($userId == $bannedBy) {
+        return ['success' => false, 'error' => 'Kendinizi yasaklayamazsınız'];
+    }
+    
+    try {
+        $db->beginTransaction();
+        
+        // Yasaklama kaydı ekle
+        $stmt = $db->prepare("INSERT INTO server_bans (server_id, user_id, banned_by, reason, banned_at) VALUES (?, ?, ?, ?, NOW())");
+        $stmt->execute([$serverId, $userId, $bannedBy, $reason]);
+        
+        // Üyelikten çıkar
+        $stmt = $db->prepare("DELETE FROM server_members WHERE server_id = ? AND user_id = ?");
+        $stmt->execute([$serverId, $userId]);
+        
+        $db->commit();
+        
+        return ['success' => true];
+    } catch (Exception $e) {
+        $db->rollBack();
+        return ['success' => false, 'error' => $e->getMessage()];
     }
 }
 
-function getFriends($userId) {
+// Sesli odada aktif kullanıcıları getir
+function getVoiceChannelParticipants($channelId) {
     $db = getDB();
     
-    $stmt = $db->prepare("SELECT f.*, u.username, u.avatar, u.status, 
-                          CASE WHEN f.requester_id = ? THEN f.addressee_id ELSE f.requester_id END as friend_id
-                          FROM friendships f 
-                          JOIN users u ON (CASE WHEN f.requester_id = ? THEN f.addressee_id ELSE f.requester_id END) = u.id
-                          WHERE (f.requester_id = ? OR f.addressee_id = ?) AND f.status = 'accepted'");
-    $stmt->execute([$userId, $userId, $userId, $userId]);
+    $stmt = $db->prepare("SELECT vp.*, u.username, u.avatar, r.color as role_color
+                          FROM voice_participants vp 
+                          JOIN users u ON vp.user_id = u.id 
+                          LEFT JOIN roles r ON u.role_id = r.id 
+                          JOIN voice_rooms vr ON vp.room_id = vr.id 
+                          WHERE vr.channel_id = ? AND vr.status = 'active'");
+    $stmt->execute([$channelId]);
     return $stmt->fetchAll();
 }
 
-function getPendingRequests($userId) {
+// Sesli oda oluştur veya getir
+function getOrCreateVoiceRoom($channelId, $userId) {
     $db = getDB();
     
-    $stmt = $db->prepare("SELECT f.*, u.username, u.avatar FROM friendships f JOIN users u ON f.requester_id = u.id WHERE f.addressee_id = ? AND f.status = 'pending'");
-    $stmt->execute([$userId]);
-    return $stmt->fetchAll();
+    // Mevcut aktif odayı kontrol et
+    $stmt = $db->prepare("SELECT * FROM voice_rooms WHERE channel_id = ? AND status = 'active'");
+    $stmt->execute([$channelId]);
+    $room = $stmt->fetch();
+    
+    if ($room) {
+        return $room;
+    }
+    
+    // Yeni oda oluştur
+    $roomCode = generateRoomCode();
+    $stmt = $db->prepare("INSERT INTO voice_rooms (channel_id, room_code, created_by, created_at) VALUES (?, ?, ?, NOW())");
+    $stmt->execute([$channelId, $roomCode, $userId]);
+    
+    return ['id' => $db->lastInsertId(), 'room_code' => $roomCode, 'channel_id' => $channelId];
 }
 
-function getUserById($userId) {
+// Sesli odaya katıl
+function joinVoiceRoom($roomId, $userId) {
     $db = getDB();
-    $stmt = $db->prepare("SELECT u.*, r.role_name, r.color FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = ?");
-    $stmt->execute([$userId]);
-    return $stmt->fetch();
+    
+    // Zaten katılmış mı kontrol et
+    $stmt = $db->prepare("SELECT id FROM voice_participants WHERE room_id = ? AND user_id = ?");
+    $stmt->execute([$roomId, $userId]);
+    if ($stmt->fetch()) {
+        return ['success' => true];
+    }
+    
+    try {
+        $stmt = $db->prepare("INSERT INTO voice_participants (room_id, user_id, joined_at) VALUES (?, ?, NOW())");
+        $stmt->execute([$roomId, $userId]);
+        return ['success' => true];
+    } catch (Exception $e) {
+        return ['success' => false, 'error' => $e->getMessage()];
+    }
+}
+
+// Sesli odadan ayrıl
+function leaveVoiceRoom($roomId, $userId) {
+    $db = getDB();
+    
+    try {
+        $stmt = $db->prepare("DELETE FROM voice_participants WHERE room_id = ? AND user_id = ?");
+        $stmt->execute([$roomId, $userId]);
+        
+        // Odada kimse kalmadıysa odayı kapat
+        $stmt = $db->prepare("SELECT COUNT(*) as count FROM voice_participants WHERE room_id = ?");
+        $stmt->execute([$roomId]);
+        $result = $stmt->fetch();
+        
+        if ($result['count'] == 0) {
+            $stmt = $db->prepare("UPDATE voice_rooms SET status = 'ended', ended_at = NOW() WHERE id = ?");
+            $stmt->execute([$roomId]);
+        }
+        
+        return ['success' => true];
+    } catch (Exception $e) {
+        return ['success' => false, 'error' => $e->getMessage()];
+    }
+}
+
+// Kullanıcı ses durumunu güncelle
+function updateVoiceStatus($roomId, $userId, $isAudioOn, $isVideoOn, $isScreenSharing) {
+    $db = getDB();
+    
+    try {
+        $stmt = $db->prepare("UPDATE voice_participants 
+                              SET is_audio_on = ?, is_video_on = ?, is_screen_sharing = ? 
+                              WHERE room_id = ? AND user_id = ?");
+        $stmt->execute([$isAudioOn ? 1 : 0, $isVideoOn ? 1 : 0, $isScreenSharing ? 1 : 0, $roomId, $userId]);
+        return ['success' => true];
+    } catch (Exception $e) {
+        return ['success' => false, 'error' => $e->getMessage()];
+    }
 }

@@ -2,35 +2,27 @@
 // Discord Clone - Tema Güncelleme API
 require_once '../includes/config.php';
 
-// Hata gösterme kapalı (JSON yanıt bozulmasın)
-error_reporting(0);
-ini_set('display_errors', 0);
-
 header('Content-Type: application/json');
 
-// Giriş kontrolü
-if (!isLoggedIn()) {
-    echo json_encode(['success' => false, 'error' => 'Yetkisiz erişim']);
-    exit;
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    jsonResponse(false, [], 'Geçersiz istek metodu');
 }
 
-$json = file_get_contents('php://input');
-$data = json_decode($json, true);
+requireAuth();
 
-if (!$data) {
-    echo json_encode(['success' => false, 'error' => 'Geçersiz JSON verisi']);
-    exit;
-}
-
-$theme = $data['theme'] ?? 'dark';
+$input = json_decode(file_get_contents('php://input'), true);
+$theme = $input['theme'] ?? 'dark';
 
 if (!in_array($theme, ['dark', 'light'])) {
-    echo json_encode(['success' => false, 'error' => 'Geçersiz tema']);
-    exit;
+    jsonResponse(false, [], 'Geçersiz tema');
 }
 
-$userId = $_SESSION['user_id'];
+$user = getCurrentUser();
+$db = getDB();
 
-$result = updateProfile($userId, ['theme' => $theme]);
-
-echo json_encode($result);
+$stmt = $db->prepare("UPDATE users SET theme = ? WHERE id = ?");
+if ($stmt->execute([$theme, $user['id']])) {
+    jsonResponse(true, [], 'Tema güncellendi');
+} else {
+    jsonResponse(false, [], 'Tema güncellenemedi');
+}

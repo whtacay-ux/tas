@@ -1,38 +1,52 @@
 <?php
-// Discord Clone - Arkadaşlık İsteği Yanıt API
+// Discord Clone - Arkadaşlık İsteği Yanıtlama API
 require_once '../includes/config.php';
-require_once '../includes/channels.php';
-
-// Hata gösterme kapalı (JSON yanıt bozulmasın)
-error_reporting(0);
-ini_set('display_errors', 0);
 
 header('Content-Type: application/json');
 
-// Giriş kontrolü
-if (!isLoggedIn()) {
-    echo json_encode(['success' => false, 'error' => 'Yetkisiz erişim']);
-    exit;
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    jsonResponse(false, [], 'Geçersiz istek metodu');
 }
 
-$json = file_get_contents('php://input');
-$data = json_decode($json, true);
+requireAuth();
 
-if (!$data) {
-    echo json_encode(['success' => false, 'error' => 'Geçersiz JSON verisi']);
-    exit;
-}
-
-$friendshipId = $data['friendship_id'] ?? null;
-$accept = $data['accept'] ?? false;
+$input = json_decode(file_get_contents('php://input'), true);
+$friendshipId = intval($input['friendship_id'] ?? 0);
+$accept = filter_var($input['accept'] ?? false, FILTER_VALIDATE_BOOLEAN);
 
 if (!$friendshipId) {
-    echo json_encode(['success' => false, 'error' => 'İstek ID gerekli']);
-    exit;
+    jsonResponse(false, [], 'Geçersiz istek ID');
 }
 
-$userId = $_SESSION['user_id'];
+$user = getCurrentUser();
+$db = getDB();
 
-$result = respondFriendRequest($friendshipId, $userId, $accept);
+// İsteği kontrol et
+$stmt = $db->prepare("SELECT * FROM friendships WHERE id = ? AND addressee_id = ? AND status = 'pending'");
+$stmt->execute([$friendshipId, $user['id']]);
+$friendship = $stmt->fetch();
 
-echo json_encode($result);
+if (!$friendship) {
+    jsonResponse(false, [], 'İstek bulunamadı');
+}
+
+try {
+    if ($accept) {
+        $stmt = $db->prepare("UPDATE friendships SET status = 'accepted', updated_at = NOW() WHERE id = ?");
+        $stmt->execute([$friendshipId]);
+        
+        // Bildirim oluştur
+        $stmt = $db->prepare("INSERT INTO notifications (user_id, sender_id, notification_type, content, created_at) VALUES (?, ?, 'friend_request', ?, NOW())");
+        $stmt->execute([$friendship['requester_id'], $user['id'], "{$user['username']} arkadaşlık isteğinizi kabul etti"]);
+        
+        jsonResponse(true, [], 'Arkadaşlık isteği kabul edildi');
+    } else {
+        $stmt = $db->prepare("UPDATE friendships SET status = 'blocked', updated_at = NOW() WHERE id = ?");
+        $stmt->execute([$friendshipId]);
+        
+        jsonResponse(true, [], 'Arkadaşlık isteği reddedildi');
+    }
+    
+} catch (Exception $e) {
+    jsonResponse(false, [], 'İşlem başarısız: ' . $e->getMessage());
+}

@@ -2,51 +2,53 @@
 // Discord Clone - Dosya Yükleme API
 require_once '../includes/config.php';
 
-// Hata gösterme kapalı (JSON yanıt bozulmasın)
-error_reporting(0);
-ini_set('display_errors', 0);
-
 header('Content-Type: application/json');
 
-// Giriş kontrolü
-if (!isLoggedIn()) {
-    echo json_encode(['success' => false, 'error' => 'Yetkisiz erişim']);
-    exit;
+requireAuth();
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    jsonResponse(false, [], 'Geçersiz istek metodu');
 }
 
 if (!isset($_FILES['file'])) {
-    echo json_encode(['success' => false, 'error' => 'Dosya bulunamadı']);
-    exit;
+    jsonResponse(false, [], 'Dosya bulunamadı');
 }
 
 $file = $_FILES['file'];
-$type = $_POST['type'] ?? 'media';
+$user = getCurrentUser();
 
-// İzin verilen dosya türleri
-$allowedTypes = [
-    'image/jpeg', 'image/png', 'image/gif', 'image/webp',
-    'video/mp4', 'video/webm',
-    'audio/mp3', 'audio/ogg', 'audio/wav',
-    'application/pdf',
-    'text/plain'
-];
-
-// Hedef dizin
-$uploadDir = $type === 'avatar' ? AVATAR_PATH : MEDIA_PATH;
-
-if (!file_exists($uploadDir)) {
-    mkdir($uploadDir, 0755, true);
+// Dosya boyutu kontrolü
+if ($file['size'] > MAX_FILE_SIZE) {
+    jsonResponse(false, [], 'Dosya boyutu çok büyük (max 10MB)');
 }
 
-$result = uploadFile($file, $uploadDir, $allowedTypes);
+// Dosya uzantısı kontrolü
+$allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'audio/mpeg', 'audio/wav'];
+if (!in_array($file['type'], $allowedTypes)) {
+    jsonResponse(false, [], 'Desteklenmeyen dosya türü');
+}
 
-if ($result['success']) {
-    $fileUrl = '../assets/uploads/' . ($type === 'avatar' ? 'avatars/' : 'channel_media/') . $result['file_name'];
-    echo json_encode([
-        'success' => true,
-        'url' => $fileUrl,
-        'file_name' => $result['file_name']
+// Dosya türünü belirle
+$type = 'file';
+if (strpos($file['type'], 'image/') === 0) {
+    $type = 'image';
+} elseif (strpos($file['type'], 'video/') === 0) {
+    $type = 'video';
+} elseif (strpos($file['type'], 'audio/') === 0) {
+    $type = 'audio';
+}
+
+// Benzersiz dosya adı oluştur
+$extension = pathinfo($file['name'], PATHINFO_EXTENSION);
+$filename = uniqid() . '_' . bin2hex(random_bytes(8)) . '.' . $extension;
+$uploadPath = UPLOAD_PATH . $filename;
+
+if (move_uploaded_file($file['tmp_name'], $uploadPath)) {
+    jsonResponse(true, [
+        'url' => '../assets/uploads/' . $filename,
+        'filename' => $filename,
+        'type' => $type
     ]);
 } else {
-    echo json_encode(['success' => false, 'error' => $result['error']]);
+    jsonResponse(false, [], 'Dosya yüklenemedi');
 }

@@ -1,77 +1,66 @@
 <?php
-// Discord Clone - Arkadaşlık İsteği API
+// Discord Clone - Arkadaşlık İsteği Gönderme API
 require_once '../includes/config.php';
-
-// Hata gösterme kapalı (JSON yanıt bozulmasın)
-error_reporting(0);
-ini_set('display_errors', 0);
 
 header('Content-Type: application/json');
 
-// Giriş kontrolü
-if (!isLoggedIn()) {
-    echo json_encode(['success' => false, 'error' => 'Yetkisiz erişim']);
-    exit;
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    jsonResponse(false, [], 'Geçersiz istek metodu');
 }
 
-// JSON veri al
-$json = file_get_contents('php://input');
-$data = json_decode($json, true);
+requireAuth();
 
-if (!$data) {
-    echo json_encode(['success' => false, 'error' => 'Geçersiz JSON verisi']);
-    exit;
-}
-
-$username = trim($data['username'] ?? '');
+$input = json_decode(file_get_contents('php://input'), true);
+$username = trim($input['username'] ?? '');
 
 if (empty($username)) {
-    echo json_encode(['success' => false, 'error' => 'Kullanıcı adı gerekli']);
-    exit;
+    jsonResponse(false, [], 'Kullanıcı adı gerekli');
 }
 
-$userId = $_SESSION['user_id'];
-
-// Kullanıcıyı bul
+$user = getCurrentUser();
 $db = getDB();
+
+// Kendine istek gönderme
+if ($username === $user['username']) {
+    jsonResponse(false, [], 'Kendinize istek gönderemezsiniz');
+}
+
+// Hedef kullanıcıyı bul
 $stmt = $db->prepare("SELECT id FROM users WHERE username = ?");
 $stmt->execute([$username]);
 $targetUser = $stmt->fetch();
 
 if (!$targetUser) {
-    echo json_encode(['success' => false, 'error' => 'Kullanıcı bulunamadı']);
-    exit;
+    jsonResponse(false, [], 'Kullanıcı bulunamadı');
 }
 
-if ($targetUser['id'] == $userId) {
-    echo json_encode(['success' => false, 'error' => 'Kendinize istek gönderemezsiniz']);
-    exit;
-}
+// Zaten arkadaş mı kontrol et
+$stmt = $db->prepare("SELECT id, status FROM friendships 
+                      WHERE (requester_id = ? AND addressee_id = ?) 
+                         OR (requester_id = ? AND addressee_id = ?)");
+$stmt->execute([$user['id'], $targetUser['id'], $targetUser['id'], $user['id']]);
+$existing = $stmt->fetch();
 
-// DÜZELTİLDİ: Direkt veritabanı işlemi (channels.php bağımlılığını kaldır)
-try {
-    // Mevcut isteği kontrol et
-    $stmt = $db->prepare("SELECT status FROM friendships WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?)");
-    $stmt->execute([$userId, $targetUser['id'], $targetUser['id'], $userId]);
-    $existing = $stmt->fetch();
-    
-    if ($existing) {
-        echo json_encode(['success' => false, 'error' => 'Zaten bir istek mevcut veya arkadaşsınız']);
-        exit;
+if ($existing) {
+    if ($existing['status'] === 'accepted') {
+        jsonResponse(false, [], 'Bu kullanıcı zaten arkadaşınız');
+    } elseif ($existing['status'] === 'pending') {
+        jsonResponse(false, [], 'Bekleyen bir istek zaten var');
+    } elseif ($existing['status'] === 'blocked') {
+        jsonResponse(false, [], 'Bu kullanıcı engellenmiş');
     }
-    
-    // Yeni istek oluştur
+}
+
+try {
     $stmt = $db->prepare("INSERT INTO friendships (requester_id, addressee_id, status, created_at) VALUES (?, ?, 'pending', NOW())");
-    $stmt->execute([$userId, $targetUser['id']]);
+    $stmt->execute([$user['id'], $targetUser['id']]);
     
     // Bildirim oluştur
-    $stmt = $db->prepare("INSERT INTO notifications (user_id, sender_id, notification_type, content, is_read, created_at) VALUES (?, ?, 'friend_request', ?, 0, NOW())");
-    $stmt->execute([$targetUser['id'], $userId, 'Yeni arkadaşlık isteği']);
+    $stmt = $db->prepare("INSERT INTO notifications (user_id, sender_id, notification_type, content, created_at) VALUES (?, ?, 'friend_request', ?, NOW())");
+    $stmt->execute([$targetUser['id'], $user['id'], "{$user['username']} size arkadaşlık isteği gönderdi"]);
     
-    if (ob_get_level()) ob_end_clean();
-    echo json_encode(['success' => true]);
+    jsonResponse(true, [], 'Arkadaşlık isteği gönderildi');
     
-} catch (PDOException $e) {
-    if (ob_get_level()) ob_end_clean();
-    echo json_encode(['success' => false, 'error' => 'Veritabanı hatası: ' . $e->getMessage()]);
+} catch (Exception $e) {
+    jsonResponse(false, [], 'İstek gönderilemedi: ' . $e->getMessage());
 }

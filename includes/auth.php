@@ -1,215 +1,165 @@
 <?php
 // Discord Clone - Kimlik Doğrulama İşlemleri
-
 require_once 'config.php';
-
-// Kullanıcı kaydı
-function registerUser($username, $email, $password, $confirmPassword) {
-    $errors = [];
-    
-    // Validasyon
-    if (empty($username) || strlen($username) < 3 || strlen($username) > 50) {
-        $errors[] = "Kullanıcı adı 3-50 karakter arasında olmalıdır";
-    }
-    
-    if (!preg_match('/^[a-zA-Z0-9_]+$/', $username)) {
-        $errors[] = "Kullanıcı adı sadece harf, rakam ve alt çizgi içerebilir";
-    }
-    
-    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        $errors[] = "Geçerli bir e-posta adresi girin";
-    }
-    
-    if (strlen($password) < 6) {
-        $errors[] = "Şifre en az 6 karakter olmalıdır";
-    }
-    
-    if ($password !== $confirmPassword) {
-        $errors[] = "Şifreler eşleşmiyor";
-    }
-    
-    if (!empty($errors)) {
-        return ['success' => false, 'errors' => $errors];
-    }
-    
-    $db = getDB();
-    
-    // Kullanıcı adı veya email kontrolü
-    $stmt = $db->prepare("SELECT id FROM users WHERE username = ? OR email = ?");
-    $stmt->execute([$username, $email]);
-    if ($stmt->fetch()) {
-        return ['success' => false, 'errors' => ["Bu kullanıcı adı veya e-posta zaten kullanılıyor"]];
-    }
-    
-    // Şifre hashle
-    $hashedPassword = password_hash($password, PASSWORD_BCRYPT);
-    
-    // Kullanıcıyı kaydet
-    $stmt = $db->prepare("INSERT INTO users (username, email, password, role_id) VALUES (?, ?, ?, 3)");
-    try {
-        $stmt->execute([$username, $email, $hashedPassword]);
-        $userId = $db->lastInsertId();
-        
-        // Varsayılan kullanıcı ayarlarını oluştur
-        $stmt = $db->prepare("INSERT INTO user_settings (user_id) VALUES (?)");
-        $stmt->execute([$userId]);
-        
-        return ['success' => true, 'user_id' => $userId];
-    } catch (PDOException $e) {
-        return ['success' => false, 'errors' => ["Kayıt sırasında hata oluştu: " . $e->getMessage()]];
-    }
-}
 
 // Kullanıcı girişi
 function loginUser($usernameOrEmail, $password, $remember = false) {
     $db = getDB();
     
     // Kullanıcıyı bul
-    $stmt = $db->prepare("SELECT u.*, r.role_name, r.permissions FROM users u JOIN roles r ON u.role_id = r.id WHERE u.username = ? OR u.email = ?");
+    $stmt = $db->prepare("SELECT * FROM users WHERE username = ? OR email = ?");
     $stmt->execute([$usernameOrEmail, $usernameOrEmail]);
     $user = $stmt->fetch();
     
     if (!$user) {
-        return ['success' => false, 'error' => "Kullanıcı bulunamadı"];
+        return ['success' => false, 'error' => 'Kullanıcı adı veya şifre hatalı'];
     }
     
+    // Şifreyi doğrula
     if (!password_verify($password, $user['password'])) {
-        return ['success' => false, 'error' => "Şifre hatalı"];
+        return ['success' => false, 'error' => 'Kullanıcı adı veya şifre hatalı'];
     }
     
-    // Oturum bilgilerini ayarla
+    // Şifre yenileme gerekiyorsa (eski hash)
+    if (password_needs_rehash($user['password'], PASSWORD_DEFAULT)) {
+        $newHash = password_hash($password, PASSWORD_DEFAULT);
+        $stmt = $db->prepare("UPDATE users SET password = ? WHERE id = ?");
+        $stmt->execute([$newHash, $user['id']]);
+    }
+    
+    // Oturum başlat
     $_SESSION['user_id'] = $user['id'];
     $_SESSION['username'] = $user['username'];
-    $_SESSION['role'] = $user['role_name'];
     
     // Durumu güncelle
-    $stmt = $db->prepare("UPDATE users SET status = 'online', last_seen = NOW() WHERE id = ?");
-    $stmt->execute([$user['id']]);
+    updateUserStatus($user['id'], 'online');
     
-    // Beni hatırla
+    // Beni hatırla çerezi
     if ($remember) {
         $token = bin2hex(random_bytes(32));
-        setcookie('remember_token', $token, time() + 30 * 24 * 60 * 60, '/');
-        // Token veritabanına kaydedilebilir
+        setcookie('remember_token', $token, time() + 30 * 24 * 60 * 60, '/', '', false, true);
+        
+        $stmt = $db->prepare("UPDATE users SET remember_token = ? WHERE id = ?");
+        $stmt->execute([$token, $user['id']]);
     }
+    
+    // Varsayılan ayarları oluştur
+    createDefaultUserSettings($user['id']);
     
     return ['success' => true, 'user' => $user];
 }
 
-// Kullanıcı çıkışı
-function logoutUser() {
-    if (isLoggedIn()) {
-        $db = getDB();
-        $stmt = $db->prepare("UPDATE users SET status = 'offline', last_seen = NOW() WHERE id = ?");
-        $stmt->execute([$_SESSION['user_id']]);
-    }
-    
-    // Oturumları temizle
-    session_destroy();
-    setcookie('remember_token', '', time() - 3600, '/');
-    
-    return true;
-}
-
-// Şifre değiştirme
-function changePassword($userId, $currentPassword, $newPassword, $confirmPassword) {
-    if (strlen($newPassword) < 6) {
-        return ['success' => false, 'error' => "Yeni şifre en az 6 karakter olmalıdır"];
-    }
-    
-    if ($newPassword !== $confirmPassword) {
-        return ['success' => false, 'error' => "Şifreler eşleşmiyor"];
-    }
-    
+// Kullanıcı kaydı
+function registerUser($username, $email, $password, $confirmPassword) {
+    $errors = [];
     $db = getDB();
     
-    // Mevcut şifreyi kontrol et
-    $stmt = $db->prepare("SELECT password FROM users WHERE id = ?");
-    $stmt->execute([$userId]);
-    $user = $stmt->fetch();
-    
-    if (!password_verify($currentPassword, $user['password'])) {
-        return ['success' => false, 'error' => "Mevcut şifre hatalı"];
+    // Validasyon
+    if (strlen($username) < 3 || strlen($username) > 50) {
+        $errors[] = 'Kullanıcı adı 3-50 karakter arasında olmalı';
     }
     
-    // Yeni şifreyi kaydet
-    $hashedPassword = password_hash($newPassword, PASSWORD_BCRYPT);
-    $stmt = $db->prepare("UPDATE users SET password = ? WHERE id = ?");
-    $stmt->execute([$hashedPassword, $userId]);
+    if (!preg_match('/^[a-zA-Z0-9_]+$/', $username)) {
+        $errors[] = 'Kullanıcı adı sadece harf, rakam ve alt çizgi içerebilir';
+    }
+    
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $errors[] = 'Geçerli bir e-posta adresi girin';
+    }
+    
+    if (strlen($password) < 6) {
+        $errors[] = 'Şifre en az 6 karakter olmalı';
+    }
+    
+    if ($password !== $confirmPassword) {
+        $errors[] = 'Şifreler eşleşmiyor';
+    }
+    
+    if (!empty($errors)) {
+        return ['success' => false, 'errors' => $errors];
+    }
+    
+    // Benzersizlik kontrolü
+    $stmt = $db->prepare("SELECT id FROM users WHERE username = ? OR email = ?");
+    $stmt->execute([$username, $email]);
+    if ($stmt->fetch()) {
+        return ['success' => false, 'errors' => ['Bu kullanıcı adı veya e-posta zaten kullanımda']];
+    }
+    
+    // Şifreyi hashle
+    $hash = password_hash($password, PASSWORD_DEFAULT);
+    
+    // Varsayılan rol (Member = 3)
+    $defaultRoleId = 3;
+    
+    // Kullanıcıyı oluştur
+    $stmt = $db->prepare("INSERT INTO users (username, email, password, role_id, status, created_at) VALUES (?, ?, ?, ?, 'online', NOW())");
+    $stmt->execute([$username, $email, $hash, $defaultRoleId]);
+    $userId = $db->lastInsertId();
+    
+    // Varsayılan ayarları oluştur
+    createDefaultUserSettings($userId);
+    
+    // Genel sunucuya otomatik ekle
+    addUserToDefaultServer($userId);
+    
+    return ['success' => true, 'user_id' => $userId];
+}
+
+// Varsayılan kullanıcı ayarları
+function createDefaultUserSettings($userId) {
+    $db = getDB();
+    $stmt = $db->prepare("INSERT IGNORE INTO user_settings (user_id, notification_sound, desktop_notifications, show_email, language) VALUES (?, 1, 1, 0, 'tr')");
+    $stmt->execute([$userId]);
+}
+
+// Kullanıcıyı varsayılan sunucuya ekle
+function addUserToDefaultServer($userId) {
+    $db = getDB();
+    
+    // Genel Sunucu'yu bul (id = 1)
+    $stmt = $db->prepare("SELECT id FROM servers WHERE id = 1");
+    $stmt->execute();
+    $server = $stmt->fetch();
+    
+    if ($server) {
+        // Üye olarak ekle (rol_id = 3 - Member)
+        $stmt = $db->prepare("INSERT IGNORE INTO server_members (server_id, user_id, role_id) VALUES (?, ?, 3)");
+        $stmt->execute([$server['id'], $userId]);
+    }
+}
+
+// Çıkış yap
+function logoutUser() {
+    if (isset($_SESSION['user_id'])) {
+        updateUserStatus($_SESSION['user_id'], 'offline');
+    }
+    
+    // Çerezleri temizle
+    setcookie('remember_token', '', time() - 3600, '/');
+    
+    // Oturumu sonlandır
+    session_destroy();
     
     return ['success' => true];
 }
 
-// Profil güncelleme
-function updateProfile($userId, $data) {
-    $allowedFields = ['username', 'email', 'avatar', 'theme'];
-    $updates = [];
-    $params = [];
+// Beni hatırla ile oturum aç
+function checkRememberToken() {
+    if (isLoggedIn()) return true;
+    if (!isset($_COOKIE['remember_token'])) return false;
     
-    foreach ($data as $field => $value) {
-        if (in_array($field, $allowedFields)) {
-            $updates[] = "$field = ?";
-            $params[] = $value;
-        }
+    $db = getDB();
+    $stmt = $db->prepare("SELECT * FROM users WHERE remember_token = ?");
+    $stmt->execute([$_COOKIE['remember_token']]);
+    $user = $stmt->fetch();
+    
+    if ($user) {
+        $_SESSION['user_id'] = $user['id'];
+        $_SESSION['username'] = $user['username'];
+        updateUserStatus($user['id'], 'online');
+        return true;
     }
     
-    if (empty($updates)) {
-        return ['success' => false, 'error' => "Güncellenecek alan yok"];
-    }
-    
-    $params[] = $userId;
-    $db = getDB();
-    
-    $sql = "UPDATE users SET " . implode(', ', $updates) . " WHERE id = ?";
-    $stmt = $db->prepare($sql);
-    
-    try {
-        $stmt->execute($params);
-        return ['success' => true];
-    } catch (PDOException $e) {
-        return ['success' => false, 'error' => "Güncelleme hatası: " . $e->getMessage()];
-    }
-}
-
-// Kullanıcı durumunu güncelle
-function updateUserStatus($userId, $status) {
-    $validStatuses = ['online', 'offline', 'idle', 'dnd'];
-    if (!in_array($status, $validStatuses)) {
-        return false;
-    }
-    
-    $db = getDB();
-    $stmt = $db->prepare("UPDATE users SET status = ? WHERE id = ?");
-    return $stmt->execute([$status, $userId]);
-}
-
-// Tüm kullanıcıları getir (admin için)
-function getAllUsers($limit = 50, $offset = 0) {
-    $db = getDB();
-    $stmt = $db->prepare("SELECT u.id, u.username, u.email, u.avatar, u.status, u.created_at, r.role_name, r.color FROM users u JOIN roles r ON u.role_id = r.id ORDER BY u.created_at DESC LIMIT ? OFFSET ?");
-    $stmt->execute([$limit, $offset]);
-    return $stmt->fetchAll();
-}
-
-// Kullanıcıyı ID'ye göre getir
-function getUserById($userId) {
-    $db = getDB();
-    $stmt = $db->prepare("SELECT u.*, r.role_name, r.color FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = ?");
-    $stmt->execute([$userId]);
-    return $stmt->fetch();
-}
-
-// Kullanıcı rolünü güncelle (admin için)
-function updateUserRole($userId, $roleId) {
-    $db = getDB();
-    $stmt = $db->prepare("UPDATE users SET role_id = ? WHERE id = ?");
-    return $stmt->execute([$roleId, $userId]);
-}
-
-// Kullanıcıyı yasakla (admin için)
-function banUser($userId, $reason = '') {
-    $db = getDB();
-    // Kullanıcıyı sil veya ayrı bir banned tablosuna ekle
-    $stmt = $db->prepare("DELETE FROM users WHERE id = ?");
-    return $stmt->execute([$userId]);
+    return false;
 }

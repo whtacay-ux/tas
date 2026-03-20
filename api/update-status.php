@@ -1,37 +1,26 @@
 <?php
 // Discord Clone - Durum Güncelleme API
 require_once '../includes/config.php';
-require_once '../includes/auth.php';
-
-// Hata gösterme kapalı (JSON yanıt bozulmasın)
-error_reporting(0);
-ini_set('display_errors', 0);
 
 header('Content-Type: application/json');
 
-// Giriş kontrolü
-if (!isLoggedIn()) {
-    echo json_encode(['success' => false, 'error' => 'Yetkisiz erişim']);
-    exit;
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    jsonResponse(false, [], 'Geçersiz istek metodu');
 }
 
-$json = file_get_contents('php://input');
-$data = json_decode($json, true);
+requireAuth();
 
-if (!$data) {
-    echo json_encode(['success' => false, 'error' => 'Geçersiz JSON verisi']);
-    exit;
-}
-
-$status = $data['status'] ?? 'online';
+$input = json_decode(file_get_contents('php://input'), true);
+$status = $input['status'] ?? 'online';
 
 if (!in_array($status, ['online', 'offline', 'idle', 'dnd'])) {
-    echo json_encode(['success' => false, 'error' => 'Geçersiz durum']);
-    exit;
+    jsonResponse(false, [], 'Geçersiz durum');
 }
 
-$userId = $_SESSION['user_id'];
+$user = getCurrentUser();
 
-$result = updateUserStatus($userId, $status);
-
-echo json_encode(['success' => $result]);
+if (updateUserStatus($user['id'], $status)) {
+    jsonResponse(true, [], 'Durum güncellendi');
+} else {
+    jsonResponse(false, [], 'Durum güncellenemedi');
+}

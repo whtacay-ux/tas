@@ -1,46 +1,29 @@
 <?php
-// Discord Clone - Bildirimler API
+// Discord Clone - Bildirimleri Getirme API
 require_once '../includes/config.php';
-require_once '../includes/channels.php';
-
-// Hata gösterme kapalı (JSON yanıt bozulmasın)
-error_reporting(0);
-ini_set('display_errors', 0);
 
 header('Content-Type: application/json');
 
-// Giriş kontrolü
-if (!isLoggedIn()) {
-    echo json_encode(['success' => false, 'error' => 'Yetkisiz erişim']);
-    exit;
-}
+requireAuth();
 
-$userId = $_SESSION['user_id'];
-$method = $_SERVER['REQUEST_METHOD'];
+$user = getCurrentUser();
+$db = getDB();
 
-if ($method === 'GET') {
-    $unreadOnly = isset($_GET['unread']) && $_GET['unread'] === '1';
-    $notifications = getUserNotifications($userId, $unreadOnly);
-    
-    echo json_encode(['success' => true, 'notifications' => $notifications]);
-    
-} elseif ($method === 'POST') {
-    $json = file_get_contents('php://input');
-    $data = json_decode($json, true);
-    
-    if (!$data) {
-        echo json_encode(['success' => false, 'error' => 'Geçersiz JSON verisi']);
-        exit;
-    }
-    
-    $notificationId = $data['notification_id'] ?? null;
-    
-    if ($notificationId) {
-        $result = markNotificationRead($notificationId, $userId);
-        echo json_encode(['success' => $result]);
-    } else {
-        // Tümünü okundu işaretle
-        $result = markAllNotificationsRead($userId);
-        echo json_encode(['success' => $result]);
-    }
-}
+// Okunmamış bildirimleri getir
+$stmt = $db->prepare("SELECT n.*, u.username as sender_name, u.avatar as sender_avatar 
+                      FROM notifications n 
+                      LEFT JOIN users u ON n.sender_id = u.id 
+                      WHERE n.user_id = ? 
+                      ORDER BY n.created_at DESC LIMIT 50");
+$stmt->execute([$user['id']]);
+$notifications = $stmt->fetchAll();
+
+// Okunmamış sayısını getir
+$stmt = $db->prepare("SELECT COUNT(*) as count FROM notifications WHERE user_id = ? AND is_read = 0");
+$stmt->execute([$user['id']]);
+$unreadCount = $stmt->fetch()['count'];
+
+jsonResponse(true, [
+    'notifications' => $notifications,
+    'unread_count' => $unreadCount
+]);
